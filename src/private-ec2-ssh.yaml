@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Private EC2 with Bastion Host for SSH Access'
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSHアクセス用の既存キーペア名
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2インスタンスタイプ
+  AllowedSSHCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: SSHアクセスを許可するCIDRブロック（セキュリティのため制限することを推奨）
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 環境名
+
+Mappings:
+  RegionMap:
+    ap-northeast-1:
+      AMI: ami-0579ac30db71cf0a7
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-subnet'
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-private-subnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  BastionSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Bastion SSH Access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-bastion-sg'
+
+  PrivateSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Private EC2 SSH Access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSG
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-private-sg'
+
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref BastionSG
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-bastion-ec2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeviceIndex: 0
+          SubnetId: !Ref PrivateSubnet
+          GroupSet:
+            - !Ref PrivateSG
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-private-ec2'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${Environment}-vpc-id'
+
+  BastionPublicIP:
+    Description: Public IP for Bastion Host
+    Value: !GetAtt BastionInstance.PublicIp
+    Export:
+      Name: !Sub '${Environment}-bastion-public-ip'
+
+  PrivateInstanceID:
+    Description: Private EC2 Instance ID
+    Value: !Ref PrivateInstance
+    Export:
+      Name: !Sub '${Environment}-private-instance-id'
+
+  PrivateInstancePrivateIP:
+    Description: Private EC2 Private IP
+    Value: !GetAtt PrivateInstance.PrivateIp
+    Export:
+      Name: !Sub '${Environment}-private-instance-ip'
+
+  BastionSGId:
+    Description: Bastion Security Group ID
+    Value: !Ref BastionSG
+    Export:
+      Name: !Sub '${Environment}-bastion-sg-id'
+
+  PrivateSGId:
+    Description: Private Security Group ID
+    Value: !Ref PrivateSG
+    Export:
+      Name: !Sub '${Environment}-private-sg-id'
