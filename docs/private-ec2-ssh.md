@@ -1,5 +1,202 @@
 # Private EC2 with Bastion Host - CloudFormation テンプレート
 
+追加対応、プライベートサブネットに配置したEC2にNginxを設置
+API Gateway
+
+ドメインを購入せずに AWS 上で “ブラウザ警告が出ない” HTTPS を成立させる方法は、実は **ALB/NLB だけでは到達できません**。
+しかし **「AWS が保有する既定ドメイン」** をそのまま使うという割り切りをすれば、追加コストなしで正規の TLS 証明書が付きます。
+
+---
+
+### 1. そもそも ALB/NLB では無理
+
+* HTTPS リスナーには **X.509 証明書を必ずアタッチ**。証明書には FQDN が必要で、`*.elb.amazonaws.com` をカバーする証明書は AWS 側では提供されていません。([docs.aws.amazon.com][1])
+
+---
+
+### 2. 「AWS 既定ドメインをそのまま使う」3 パターン
+
+| パターン | サービス                             | 既定ドメイン例                                             | 仕組み                                                                             |
+| ---- | -------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------- |
+| A    | **CloudFront**                   | `d111111abcdef8.cloudfront.net`                     | `*.cloudfront.net` の証明書が自動添付。独自ドメイン不要でも HTTPS が即時有効([docs.aws.amazon.com][2])   |
+| B    | **API Gateway** (REST/HTTP)      | `abcd1234.execute-api.ap-northeast-1.amazonaws.com` | `execute-api` ドメインは API Gateway が証明書を管理し、常に HTTPS で公開([docs.aws.amazon.com][3]) |
+| C    | **Amplify/Cognito Hosted UI** など | サービス固有サブドメイン                                        | 背後で CloudFront を利用しており同様に証明書自動付与                                                |
+
+> URL が長くなっても構わない PoC であれば、このどれかを採用するのが最速。
+
+---
+
+### 3. 内向き PoC 専用: 自己署名証明書 + SSH ポートフォワード
+
+* EC2 に Nginx を置き、`openssl` で自己署名証明書を作成して 443 を開放
+* 踏み台経由で `ssh -L 8443:10.0.1.10:443 …`
+* ブラウザで `https://localhost:8443` を開けば暗号化通信は確認できる（警告は無視）
+
+完全無料・ドメイン不要だが、警告を許容できるメンバー限定の検証向け。
+
+---
+
+### 4. 選択早見表
+
+| 要件                 | 推奨方式                   |
+| ------------------ | ---------------------- |
+| 外部公開／警告なし／ドメイン買わない | **CloudFront 既定ドメイン**  |
+| API だけ公開／ドメイン買わない  | **API Gateway 既定ドメイン** |
+| 社内限定／踏み台経由で十分      | **自己署名 + ポートフォワード**    |
+
+---
+
+### 5. CloudFront 例 ─ 最小手順
+
+```bash
+# S3 を静的オリジン化
+aws s3 mb s3://my-poc-site
+aws s3 cp index.html s3://my-poc-site --acl public-read
+
+# CloudFront ディストリビューション作成
+aws cloudfront create-distribution \
+  --origin-domain-name my-poc-site.s3.amazonaws.com \
+  --default-root-object index.html \
+  --query 'Distribution.DomainName'
+# => d111111abcdef8.cloudfront.net
+
+# 数分後にブラウザで https://d111111abcdef8.cloudfront.net
+```
+
+ACM、Route 53、ドメイン購入は一切不要。
+
+---
+
+## ✅ 結論
+
+* **ALB だけで“証明書レス”HTTPSは物理的に不可**。
+* **ドメイン購入ゼロで警告なし HTTPS** を実現したいなら
+
+  1. **CloudFront** 既定ドメイン
+  2. **API Gateway** 既定ドメイン
+     が王道（いずれも AWS 側がワイルドカード証明書を保有）。([docs.aws.amazon.com][2], [docs.aws.amazon.com][3])
+* 完全クローズドな検証なら自己署名でも OK。
+
+CloudFront / API Gateway の Terraform テンプレートや Nginx SSL 設定スニペットが必要なら、いつでも声をかけてください！
+
+[1]: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/https-listener-certificates.html "SSL certificates for your Application Load Balancer - Elastic Load Balancing"
+[2]: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DownloadDistValuesGeneral.html "Distribution settings - Amazon CloudFront"
+[3]: https://docs.aws.amazon.com/apigateway/latest/developerguide/data-protection-encryption.html "Data encryption in Amazon API Gateway - Amazon API Gateway"
+
+
+以下、**「Nginx設置 → ブラウザアクセス可能化」** を
+現在の **private EC2 +踏み台 + ALB構造** に準拠しつつ **AWS CloudFormationで実現する方法** をわかりやすく整理します。
+
+---
+
+## 1️⃣ 前提（現状）
+
+* プライベートサブネット内に **Nginxを設置したEC2** がいる
+* このEC2には **Public IPがなく直接外部アクセス不可**
+* 現状は踏み台経由でのみSSH可能
+
+---
+
+## 2️⃣ 目標
+
+* **外部ブラウザから直接Nginx（HTTP:80）へアクセス可能にする**
+* ただし **privateサブネットのままで運用（Public IPを付与しない）**
+
+---
+
+## 3️⃣ 実現アプローチ
+
+### ✅ **ALB (Application Load Balancer) を配置する**
+
+ALBはPublicサブネットに配置し、インターネット経由でHTTP(80)をリスン。
+ターゲットグループには **privateサブネット内のNginx EC2** を登録。
+
+ブラウザからのフロー：
+
+```
+Client Browser
+     ↓
+ALB (Public Subnet, Public IP, HTTP:80)
+     ↓
+Nginx EC2 (Private Subnet, Private IP, HTTP:80)
+```
+
+---
+
+## 4️⃣ ALB構築時に必要なリソース
+
+✅ **ALB**
+
+* Public Subnetに配置
+* Internet-facing（Public IP持ち）
+* HTTP (Port 80) Listener設定
+
+✅ **Target Group**
+
+* ターゲット：プライベートサブネットのNginx EC2 (HTTP:80)
+* ヘルスチェックパス `/`（またはNginxの任意のヘルスエンドポイント）
+
+✅ **Security Groups**
+
+* ALB SG:
+
+  * `0.0.0.0/0` からの `Port 80` を許可
+* Private EC2 SG:
+
+  * ALB SG からの `Port 80` を許可
+
+---
+
+## 5️⃣ CloudFormation実装フロー
+
+1️⃣ VPC・Public Subnet・Private Subnet（すでに作成済）
+2️⃣ ALB作成（`AWS::ElasticLoadBalancingV2::LoadBalancer`）
+3️⃣ ALB用SG作成（HTTP:80を開放）
+4️⃣ Target Group作成（`AWS::ElasticLoadBalancingV2::TargetGroup`）
+5️⃣ ALB Listener作成（`AWS::ElasticLoadBalancingV2::Listener`）
+6️⃣ Private EC2 SGにALB SGからのHTTP(80)許可ルール追加
+7️⃣ プライベートサブネットに配置したNginx EC2をターゲットグループに登録
+
+---
+
+## 6️⃣ 運用イメージ
+
+✅ ALBのDNS名をブラウザに入力
+✅ HTTPリクエストがALBへ到達
+✅ ALBがターゲットグループ（Nginx EC2）へHTTP(80)で転送
+✅ Nginxがレスポンスを返す
+✅ ALB経由でブラウザに返答
+
+---
+
+## 7️⃣ メリット
+
+✅ プライベートサブネットにPublic IP不要でセキュリティを確保
+✅ ALB経由の可用性・拡張性（複数EC2構成、AutoScaling対応可）
+✅ CloudFormationによりIaCで再現性確保
+
+---
+
+## まとめ
+
+「Nginx設置 → ブラウザアクセス可能化」を踏み台不要で実現するには：
+
+✅ **ALBをPublic Subnetに配置し、ALB経由でPrivate SubnetのNginxへ転送する**
+
+これが **最適かつ企業PoC・本番向けのベストプラクティス** です。
+
+---
+
+## 🚀 次アクション
+
+この理解の上で、
+✅ **即適用可能な CloudFormation YAMLサンプル**
+✅ **CLIテスト手順**
+
+を作成可能です。
+**必要であれば「作成OK」とだけお伝えください。即作成に移行します。**
+
+
 ## 概要
 
 このCloudFormationテンプレートは、セキュアなプライベートEC2環境を構築します。Bastionホストを経由してプライベートサブネット内のEC2インスタンスにSSHアクセスできる構成です。
